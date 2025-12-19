@@ -1,88 +1,126 @@
-# FILE: src/universes.py
+# src/universes.py
+# Loads curated ticker universes from CSV files under /universes
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import pandas as pd
-import yfinance as yf
-
-PRESET_FILES = {
-    "Mega Caps": "universes/megacaps.csv",
-    "S&P 500": "universes/sp500.csv",
-    "ETFs": "universes/etfs.csv",
-}
 
 
-def normalize_tickers(tickers: list[str]) -> list[str]:
-    out = []
-    for t in tickers:
-        if t is None:
-            continue
-        t = str(t).strip().upper()
-        if not t:
-            continue
-        # Yahoo format: BRK.B -> BRK-B
-        t = t.replace(".", "-")
-        out.append(t)
-    # dedupe preserving order
+@dataclass(frozen=True)
+class UniverseSpec:
+    """Defines one selectable universe in the app."""
+    key: str          # internal id (stable)
+    label: str        # UI label
+    csv_path: Path    # path to CSV file with a 'ticker' column
+
+
+def _project_root() -> Path:
+    """
+    Resolve project root assuming this file lives in: <root>/src/universes.py
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def _clean_ticker(t: str) -> str:
+    """
+    Normalize tickers for yfinance:
+    - strip spaces
+    - uppercase
+    - convert '.' to '-' (e.g., BRK.B -> BRK-B)
+    """
+    if t is None:
+        return ""
+    return str(t).strip().upper().replace(".", "-")
+
+
+def load_universe_from_csv(csv_path: Path) -> List[str]:
+    """
+    Load tickers from a CSV with at least a 'ticker' column.
+    Returns a de-duplicated, cleaned list preserving original order.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Universe file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    if "ticker" not in df.columns:
+        raise ValueError(
+            f"Universe CSV must contain a 'ticker' column. Missing in: {csv_path.name}"
+        )
+
+    # Clean + drop empty
+    tickers_raw = df["ticker"].astype(str).map(_clean_ticker)
+    tickers_raw = tickers_raw[tickers_raw != ""]
+
+    # De-duplicate preserving order
     seen = set()
-    res = []
-    for t in out:
+    tickers: List[str] = []
+    for t in tickers_raw.tolist():
         if t not in seen:
             seen.add(t)
-            res.append(t)
-    return res
+            tickers.append(t)
+
+    if len(tickers) == 0:
+        raise ValueError(f"No valid tickers found in: {csv_path.name}")
+
+    return tickers
 
 
-def parse_ticker_text(text: str) -> list[str]:
-    if not text:
-        return []
-    # accept commas, spaces, newlines
-    raw = text.replace(",", "\n").replace(" ", "\n").splitlines()
-    return [r for r in raw if r and r.strip()]
-
-
-def load_universe_csv(path: str) -> list[str]:
-    df = pd.read_csv(path)
-    if "Ticker" not in df.columns:
-        raise ValueError(f"Universe CSV '{path}' must contain column 'Ticker'.")
-    return normalize_tickers(df["Ticker"].astype(str).tolist())
-
-
-def quick_validate_tickers(tickers: list[str], max_batch: int = 200) -> list[str]:
+def get_default_universe_specs(universes_dir: Optional[Path] = None) -> List[UniverseSpec]:
     """
-    Fast-ish validation: downloads 5d Close for batches and flags those with no data.
+    Define the curated universes exposed in the UI.
+    CSVs live at: <root>/universes/*.csv
     """
-    tickers = normalize_tickers(tickers)
-    invalid = []
+    root = _project_root()
+    udir = universes_dir or (root / "universes")
 
-    for i in range(0, len(tickers), max_batch):
-        batch = tickers[i : i + max_batch]
-        try:
-            data = yf.download(
-                batch,
-                period="5d",
-                auto_adjust=True,
-                group_by="column",
-                threads=True,
-                progress=False,
-            )
-            if data is None or data.empty:
-                invalid.extend(batch)
-                continue
+    return [
+        UniverseSpec(key="megacaps", label="MegaCaps", csv_path=udir / "megacaps.csv"),
+        UniverseSpec(key="sp500", label="S&P 500", csv_path=udir / "sp500.csv"),
+        UniverseSpec(key="etfs", label="ETFs", csv_path=udir / "etfs.csv"),
+    ]
 
-            # Handle both single and multi index
-            if isinstance(data.columns, pd.MultiIndex):
-                data = data.swaplevel(axis=1).sort_index(axis=1)
-                close = data.xs("Close", level=1, axis=1)
-                for t in batch:
-                    if t not in close.columns or close[t].dropna().empty:
-                        invalid.append(t)
-            else:
-                # single ticker case; if it's empty, mark all
-                pass
 
-        except Exception:
-            # If yfinance blows up, mark the whole batch invalid to be safe
-            invalid.extend(batch)
+def load_all_universes(
+    specs: Optional[List[UniverseSpec]] = None,
+    universes_dir: Optional[Path] = None
+) -> Dict[str, List[str]]:
+    """
+    Loads all universes and returns a dict keyed by spec.label for UI use.
 
-    # dedupe
-    return sorted(set(invalid))
+    Example return:
+    {
+      "MegaCaps": [...],
+      "S&P 500": [...],
+      "ETFs": [...]
+    }
+    """
+    specs = specs or get_default_universe_specs(universes_dir=universes_dir)
+
+    out: Dict[str, List[str]] = {}
+    for spec in specs:
+        out[spec.label] = load_universe_from_csv(spec.csv_path)
+    return out
+
+
+def load_universe_by_key(
+    key: str,
+    specs: Optional[List[UniverseSpec]] = None,
+    universes_dir: Optional[Path] = None
+) -> List[str]:
+    """
+    Load a single universe by its stable key (e.g., 'megacaps', 'sp500', 'etfs').
+    """
+    specs = specs or get_default_universe_specs(universes_dir=universes_dir)
+    key_norm = (key or "").strip().lower()
+
+    for spec in specs:
+        if spec.key.lower() == key_norm:
+            return load_universe_from_csv(spec.csv_path)
+
+    valid = ", ".join([s.key for s in specs])
+    raise ValueError(f"Unknown universe key '{key}'. Valid: {valid}")
