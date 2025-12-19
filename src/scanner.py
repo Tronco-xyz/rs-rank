@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
+import time
+import io
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 import requests
 
 
-# -----------------------------
+# =============================================================================
 # Helpers
-# -----------------------------
+# =============================================================================
 
 def last_valid(s: pd.Series):
     s = s.dropna()
@@ -27,9 +30,16 @@ def atr_wilder(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame, windo
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).groupby(level=1, axis=1).max()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1)
+    tr = tr.groupby(level=1, axis=1).max()
+
     return tr.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
+
+# =============================================================================
+# RS
+# =============================================================================
 
 def ibd_rs_raw(
     close: pd.DataFrame,
@@ -37,8 +47,6 @@ def ibd_rs_raw(
     p12: int, p9: int, p6: int, p3: int,
     w12: float, w9: float, w6: float, w3: float,
 ) -> pd.Series:
-    if benchmark not in close.columns:
-        raise ValueError(f"Benchmark '{benchmark}' not found in Close data.")
 
     r12 = close.pct_change(p12)
     r9  = close.pct_change(p9)
@@ -68,43 +76,30 @@ def to_rs_rank_1_99(rs_raw: pd.Series) -> pd.Series:
     return rs_rank
 
 
-# -----------------------------
-# Stooq downloader
-# -----------------------------
+# =============================================================================
+# DATA DOWNLOAD – STOOQ (fallback-first for Streamlit Cloud)
+# =============================================================================
 
-def _stooq_symbol(t: str) -> str:
-    """
-    Stooq US equities use .us suffix and lower-case.
-    BRK-B -> brk-b.us
-    SPY -> spy.us
-    """
-    return f"{t.strip().lower()}.us"
+def _stooq_symbol(ticker: str) -> str:
+    return ticker.lower()
 
 
 def _fetch_stooq_ohlc(ticker: str) -> pd.DataFrame:
-    """
-    Returns OHLCV with columns: Open, High, Low, Close, Volume indexed by Date.
-    Empty df if not available.
-    """
-    sym = _stooq_symbol(ticker)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    url = f"https://stooq.com/q/d/l/?s={_stooq_symbol(ticker)}&i=d"
     r = requests.get(url, timeout=20)
-    if r.status_code != 200 or not r.text or "Date" not in r.text:
+    if r.status_code != 200 or "Date" not in r.text:
         return pd.DataFrame()
 
-    df = pd.read_csv(pd.compat.StringIO(r.text))
+    df = pd.read_csv(io.StringIO(r.text))
     if df.empty or "Date" not in df.columns:
         return pd.DataFrame()
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
 
-    # standardize expected columns
-    cols = {c: c.capitalize() for c in df.columns}
-    df = df.rename(columns=cols)
+    df.columns = [c.capitalize() for c in df.columns]
 
-    needed = ["Open", "High", "Low", "Close"]
-    for c in needed:
+    for c in ["Open", "High", "Low", "Close"]:
         if c not in df.columns:
             return pd.DataFrame()
 
@@ -119,35 +114,30 @@ def _download_ohlc_stooq(
     start_dt: datetime,
     end_dt: datetime,
 ) -> pd.DataFrame:
-    parts = []
+
+    frames = []
     for t in tickers:
-        o = _fetch_stooq_ohlc(t)
-        if o.empty:
-            continue
-        o = o.loc[(o.index >= start_dt) & (o.index <= end_dt)]
-        if o.empty:
-            continue
-        o.columns = pd.MultiIndex.from_tuples([(t, c) for c in o.columns], names=["Ticker", "Field"])
-        parts.append(o)
+        df = _fetch_stooq_ohlc(t)
+        if not df.empty:
+            df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
+            df.columns = pd.MultiIndex.from_product([[t], df.columns], names=["Ticker", "Field"])
+            frames.append(df)
+        time.sleep(0.2)
 
-    if not parts:
-        raise RuntimeError(
-            "No data returned from Stooq for any ticker. "
-            "Check internet access, tickers format, or try a smaller universe."
-        )
+    if not frames:
+        raise RuntimeError("STOOQ returned no usable data for any ticker.")
 
-    data = pd.concat(parts, axis=1).sort_index(axis=1)
-    return data
+    return pd.concat(frames, axis=1).sort_index(axis=1)
 
 
-def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
-    return max(p12, d1q, atr_window) + 5
-
+# =============================================================================
+# MAIN SCAN
+# =============================================================================
 
 def run_scan(
     universe: List[str],
     benchmark: str = "SPY",
-    lookback_days: int = 900,          # Stooq daily history often works better with a bit more buffer
+    lookback_days: int = 600,
     top_n: Optional[int] = None,
     p12: int = 252, p9: int = 189, p6: int = 126, p3: int = 63,
     w12: float = 0.20, w9: float = 0.20, w6: float = 0.20, w3: float = 0.40,
@@ -156,52 +146,18 @@ def run_scan(
     atr_multiplier: float = 2.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
-    if not universe or len(universe) < 2:
-        raise ValueError("Universe is empty or too small.")
-
-    benchmark = benchmark.strip().upper()
-    tickers = sorted(set([t.strip().upper().replace(".", "-") for t in universe] + [benchmark]))
+    benchmark = benchmark.upper()
+    tickers = sorted(set([t.upper() for t in universe] + [benchmark]))
 
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=int(lookback_days))
 
-    # Download from Stooq
+    # 🔴 Yahoo es inestable en Streamlit Cloud → usamos STOOQ directamente
     data = _download_ohlc_stooq(tickers, start_dt, end_dt)
 
     close = data.xs("Close", level=1, axis=1)
     high  = data.xs("High",  level=1, axis=1)
     low   = data.xs("Low",   level=1, axis=1)
-
-    min_bars = _min_required_bars(p12, d1q, atr_window)
-
-    def valid_col(t: str) -> bool:
-        return (
-            t in close.columns and t in high.columns and t in low.columns and
-            close[t].dropna().shape[0] >= min_bars and
-            high[t].dropna().shape[0]  >= min_bars and
-            low[t].dropna().shape[0]   >= min_bars
-        )
-
-    keep, drop = [], []
-    for t in tickers:
-        if valid_col(t):
-            keep.append(t)
-        else:
-            if t != benchmark:
-                drop.append(t)
-
-    if benchmark not in keep:
-        raise RuntimeError(f"Benchmark '{benchmark}' has insufficient data on Stooq.")
-
-    dropped_df = (
-        pd.DataFrame({"Ticker": drop, "Reason": "missing/insufficient data (Stooq)"})
-        if drop else
-        pd.DataFrame(columns=["Ticker", "Reason"])
-    )
-
-    close = close[keep]
-    high  = high[keep]
-    low   = low[keep]
 
     rs_raw  = ibd_rs_raw(close, benchmark, p12, p9, p6, p3, w12, w9, w6, w3)
     rs_rank = to_rs_rank_1_99(rs_raw)
@@ -211,42 +167,28 @@ def run_scan(
     perf_1q = pct_return(close, d1q).rename("Perf_1Q") * 100
 
     atr = atr_wilder(high, low, close, window=atr_window)
-    atr_last = atr.apply(last_valid).rename(f"ATR_{atr_window}")
-
+    atr_last = atr.apply(last_valid).rename("ATR_14")
     price_last = close.apply(last_valid).rename("Price")
 
-    idx = rs_raw.index.intersection(price_last.index)
-
     df = pd.DataFrame({
-        "RS_Rank": rs_rank.reindex(idx),
-        "RS_Raw": rs_raw.reindex(idx),
-        "Price": price_last.reindex(idx),
-        "Perf_1W": perf_1w.reindex(idx),
-        "Perf_1M": perf_1m.reindex(idx),
-        "Perf_1Q": perf_1q.reindex(idx),
-        f"ATR_{atr_window}": atr_last.reindex(idx),
-    }).dropna(subset=["RS_Rank", "Price", f"ATR_{atr_window}"])
+        "RS_Rank": rs_rank,
+        "Price": price_last,
+        "Perf_1W": perf_1w,
+        "Perf_1M": perf_1m,
+        "Perf_1Q": perf_1q,
+        "ATR_14": atr_last,
+    }).dropna()
 
-    atr_col = f"ATR_{atr_window}"
-    df["Stop_ATR"] = df["Price"] - (df[atr_col] * atr_multiplier)
-    df["Dist_to_ATR_%"] = (df[atr_col] * atr_multiplier / df["Price"]) * 100
+    df["Stop_ATR"] = df["Price"] - df["ATR_14"] * atr_multiplier
+    df["Dist_to_ATR_%"] = (df["ATR_14"] * atr_multiplier / df["Price"]) * 100
 
-    df = df.sort_values(["RS_Rank", "RS_Raw"], ascending=[False, False])
+    df = df.sort_values("RS_Rank", ascending=False)
     df.insert(0, "Pos", range(1, len(df) + 1))
 
-    if top_n is not None:
-        df = df.head(int(top_n)).copy()
+    if top_n:
+        df = df.head(top_n)
 
-    df = df.rename_axis("Ticker").reset_index()
+    df = df.reset_index().rename(columns={"index": "Ticker"})
 
-    df["RS_Raw"] = df["RS_Raw"].round(6)
-    for c in ["Price", atr_col, "Stop_ATR", "Dist_to_ATR_%", "Perf_1W", "Perf_1M", "Perf_1Q"]:
-        df[c] = df[c].round(2)
-
-    df_out = df[[
-        "Pos", "Ticker", "RS_Rank",
-        "Perf_1W", "Perf_1M", "Perf_1Q",
-        atr_col, "Stop_ATR", "Dist_to_ATR_%"
-    ]].rename(columns={atr_col: "ATR_14" if atr_window == 14 else atr_col})
-
-    return df_out, dropped_df
+    dropped = pd.DataFrame(columns=["Ticker", "Reason"])
+    return df, dropped
