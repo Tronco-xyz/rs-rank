@@ -90,6 +90,8 @@ def _download_ohlc(
     start_dt: datetime,
     end_dt: datetime,
 ) -> pd.DataFrame:
+    fields = {"Open", "High", "Low", "Close", "Volume"}
+
     data = yf.download(
         tickers=tickers,
         start=start_dt.strftime("%Y-%m-%d"),
@@ -100,10 +102,56 @@ def _download_ohlc(
         progress=False,
     )
 
-    if data is None or data.empty or not isinstance(data.columns, pd.MultiIndex):
-        raise RuntimeError("Download failed or unexpected yfinance format.")
+    if data is None or data.empty:
+        raise RuntimeError(
+            "yfinance returned empty data. Possible causes: rate-limit, market holiday/weekend, "
+            "bad tickers, or network issues on Streamlit Cloud."
+        )
 
-    return data.swaplevel(axis=1).sort_index(axis=1)
+    # Case A: Single ticker often returns single-level columns: Open/High/Low/Close/Volume
+    if not isinstance(data.columns, pd.MultiIndex):
+        # Determine which ticker it was (yfinance collapses)
+        t = tickers[0] if len(tickers) == 1 else "SINGLE"
+        # Build MultiIndex (Ticker, Field)
+        cols = []
+        for c in data.columns:
+            if str(c) in fields:
+                cols.append((t, str(c)))
+            else:
+                # keep unknown fields anyway
+                cols.append((t, str(c)))
+        data.columns = pd.MultiIndex.from_tuples(cols, names=["Ticker", "Field"])
+        return data.sort_index(axis=1)
+
+    # Case B: MultiIndex, but could be (Field, Ticker) or (Ticker, Field)
+    lvl0 = set(map(str, data.columns.get_level_values(0)))
+    lvl1 = set(map(str, data.columns.get_level_values(1)))
+
+    lvl0_is_fields = len(lvl0.intersection(fields)) >= 3
+    lvl1_is_fields = len(lvl1.intersection(fields)) >= 3
+
+    # If it's (Field, Ticker) -> swap to (Ticker, Field)
+    if lvl0_is_fields and not lvl1_is_fields:
+        data = data.swaplevel(0, 1, axis=1)
+
+    # If it's already (Ticker, Field), keep as-is
+    # If ambiguous, still force to (Ticker, Field) by checking typical field names
+    elif not lvl0_is_fields and lvl1_is_fields:
+        pass
+    else:
+        # fallback: try swap and see if we get expected fields on level=1
+        swapped = data.swaplevel(0, 1, axis=1)
+        s_lvl1 = set(map(str, swapped.columns.get_level_values(1)))
+        if len(s_lvl1.intersection(fields)) >= 3:
+            data = swapped
+
+    # Final cleanup: ensure sorted and named
+    data.columns = pd.MultiIndex.from_tuples(
+        [(str(t), str(f)) for t, f in data.columns],
+        names=["Ticker", "Field"],
+    )
+    return data.sort_index(axis=1)
+
 
 
 def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
