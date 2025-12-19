@@ -1,11 +1,7 @@
 # ==============================================================================
 # Streamlit Web App: IBD-Style RS Rank Scanner + ATR Stop Distance
-# - Universe presets stored as CSV in /universes (manual updates via download/upload)
-# - Supports session-only edits + dropped tickers table
-# - Works: local / Streamlit Cloud
 # ==============================================================================
 
-# FILE: app.py
 import io
 import pandas as pd
 import streamlit as st
@@ -20,8 +16,23 @@ from src.universes import (
 )
 
 st.set_page_config(page_title="RS Rank Scanner", layout="wide")
-
 st.title("IBD-Style RS Rank Scanner + ATR Stop")
+
+# -----------------------------
+# Helpers: session-state universe
+# -----------------------------
+def _state_key_for_preset(preset_label: str) -> str:
+    return f"universe__{preset_label}"
+
+def get_universe_for_preset(preset_label: str) -> list[str]:
+    k = _state_key_for_preset(preset_label)
+    if k not in st.session_state:
+        # First time: load from CSV
+        st.session_state[k] = load_universe_csv(PRESET_FILES[preset_label])
+    return st.session_state[k]
+
+def set_universe_for_preset(preset_label: str, tickers: list[str]) -> None:
+    st.session_state[_state_key_for_preset(preset_label)] = tickers
 
 # -----------------------------
 # Sidebar: Universe + Settings
@@ -38,10 +49,8 @@ with st.sidebar:
     st.divider()
     st.header("Scan Settings")
 
-    benchmark = st.text_input("Benchmark", value="SPY")
-
+    benchmark = st.text_input("Benchmark", value="SPY").strip().upper()
     top_n = st.number_input("Top N (0 = All)", min_value=0, max_value=2000, value=0, step=10)
-
     lookback_days = st.number_input("Lookback (calendar days)", min_value=200, max_value=2000, value=600, step=50)
 
     st.subheader("IBD RS windows (trading days)")
@@ -50,7 +59,7 @@ with st.sidebar:
     p6  = st.number_input("P6",  min_value=63,  max_value=260, value=126, step=1)
     p3  = st.number_input("P3",  min_value=21,  max_value=200, value=63, step=1)
 
-    st.subheader("IBD weights (must sum ~ 1)")
+    st.subheader("IBD weights (should sum to 1.00)")
     w12 = st.number_input("W12", min_value=0.0, max_value=1.0, value=0.20, step=0.05, format="%.2f")
     w9  = st.number_input("W9",  min_value=0.0, max_value=1.0, value=0.20, step=0.05, format="%.2f")
     w6  = st.number_input("W6",  min_value=0.0, max_value=1.0, value=0.20, step=0.05, format="%.2f")
@@ -68,17 +77,22 @@ with st.sidebar:
 
     st.divider()
     validate_toggle = st.checkbox("Quick-validate tickers (fast)", value=True)
+
+    # Weight sanity warning
+    wsum = float(w12 + w9 + w6 + w3)
+    if abs(wsum - 1.0) > 0.10:
+        st.warning(f"Weights sum = {wsum:.2f}. Recommend 1.00.")
     run_btn = st.button("Run scan", type="primary", use_container_width=True)
 
 # -----------------------------
 # Load/Build Universe
 # -----------------------------
-universe = []
+universe: list[str] = []
 universe_source_label = ""
 
 if preset in PRESET_FILES:
     universe_source_label = f"Preset: {preset}"
-    universe = load_universe_csv(PRESET_FILES[preset])
+    universe = get_universe_for_preset(preset)
 
     st.caption(f"Loaded {len(universe)} tickers — {universe_source_label}")
 
@@ -87,20 +101,24 @@ if preset in PRESET_FILES:
         txt = st.text_area("Tickers", value="\n".join(universe), height=160)
 
         colA, colB, colC = st.columns([1, 1, 1])
+
         with colA:
             if st.button("Update universe (this session)"):
-                universe = parse_ticker_text(txt)
-                universe = normalize_tickers(universe)
+                u = normalize_tickers(parse_ticker_text(txt))
+                set_universe_for_preset(preset, u)
+                universe = u
                 st.success(f"Universe updated for this session: {len(universe)} tickers")
+
         with colB:
             csv_bytes = ("Ticker\n" + "\n".join(universe) + "\n").encode("utf-8")
             st.download_button(
                 "Download CSV",
                 data=csv_bytes,
-                file_name=f"{preset.lower().replace(' ', '_')}.csv",
+                file_name=f"{preset.lower().replace(' ', '_').replace('&','and')}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
+
         with colC:
             st.write("To persist changes: replace the CSV in your GitHub repo and push.")
 
@@ -139,6 +157,11 @@ if run_btn:
     if validate_toggle:
         with st.spinner("Quick-validating tickers..."):
             invalid = quick_validate_tickers(universe, max_batch=200)
+            # validate benchmark too (if user typed something odd)
+            bench_invalid = quick_validate_tickers([benchmark], max_batch=50)
+        if bench_invalid:
+            st.error(f"Benchmark '{benchmark}' is invalid/unavailable.")
+            st.stop()
         if invalid:
             st.warning(f"Invalid/unavailable tickers (will be removed): {invalid}")
             universe = [t for t in universe if t not in invalid]
@@ -163,7 +186,6 @@ if run_btn:
     st.subheader("Results")
     st.caption(f"{universe_source_label} • Universe used: {len(universe)} • Rows: {len(df_out)}")
 
-    # Display
     st.dataframe(
         df_out,
         use_container_width=True,
@@ -178,12 +200,15 @@ if run_btn:
         },
     )
 
-    # Download results
-    csv = df_out.to_csv(index=False).encode("utf-8")
-    st.download_button("Download results CSV", data=csv, file_name="rs_rank_results.csv", mime="text/csv")
+    st.download_button(
+        "Download results CSV",
+        data=df_out.to_csv(index=False).encode("utf-8"),
+        file_name="rs_rank_results.csv",
+        mime="text/csv",
+    )
 
     st.subheader("Dropped tickers")
-    if dropped.empty:
+    if dropped is None or dropped.empty:
         st.success("None")
     else:
         st.dataframe(dropped, use_container_width=True, hide_index=True)
