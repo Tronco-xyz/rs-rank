@@ -90,21 +90,26 @@ def _download_ohlc(
     tickers: List[str],
     start_dt: datetime,
     end_dt: datetime,
-    chunk_size: int = 80,   # Streamlit Cloud: 40–100 suele ir bien
+    chunk_size: int = 25,      # más bajo para Streamlit Cloud
+    max_retries: int = 4,      # reintentos por chunk
 ) -> pd.DataFrame:
     """
     Robust yfinance downloader for Streamlit Cloud:
-    - Downloads tickers in chunks to reduce Yahoo rate-limit / payload issues.
-    - Normalizes output to MultiIndex columns (Ticker, Field).
+    - Downloads tickers in chunks
+    - Retries with backoff when Yahoo returns empty
+    - Fallback per-ticker history() if download() keeps failing
+    - Normalizes output to MultiIndex columns (Ticker, Field)
     """
+    import time
+
     fields = {"Open", "High", "Low", "Close", "Volume"}
 
     def _normalize(data: pd.DataFrame, tickers_in_chunk: List[str]) -> pd.DataFrame:
         if data is None or data.empty:
             return pd.DataFrame()
 
-        # Single ticker may return single-level columns: Open/High/Low/Close/Volume
         if not isinstance(data.columns, pd.MultiIndex):
+            # single ticker collapsed format
             t = tickers_in_chunk[0] if len(tickers_in_chunk) == 1 else "SINGLE"
             data.columns = pd.MultiIndex.from_tuples(
                 [(t, str(c)) for c in data.columns],
@@ -115,54 +120,97 @@ def _download_ohlc(
         # MultiIndex could be (Field, Ticker) or (Ticker, Field)
         lvl0 = set(map(str, data.columns.get_level_values(0)))
         lvl1 = set(map(str, data.columns.get_level_values(1)))
-
         lvl0_is_fields = len(lvl0.intersection(fields)) >= 3
         lvl1_is_fields = len(lvl1.intersection(fields)) >= 3
 
-        # If it's (Field, Ticker) -> swap to (Ticker, Field)
         if lvl0_is_fields and not lvl1_is_fields:
             data = data.swaplevel(0, 1, axis=1)
-        # else if already (Ticker, Field), do nothing
 
-        # Final cleanup: ensure names + string types
         data.columns = pd.MultiIndex.from_tuples(
             [(str(t), str(f)) for t, f in data.columns],
             names=["Ticker", "Field"],
         )
         return data.sort_index(axis=1)
 
+    def _download_chunk(chunk: List[str]) -> pd.DataFrame:
+        # retry loop
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(
+                    tickers=chunk,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=end_dt.strftime("%Y-%m-%d"),
+                    auto_adjust=True,
+                    group_by="column",
+                    threads=False,     # importante en Streamlit Cloud
+                    progress=False,
+                )
+                df = _normalize(df, chunk)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+
+            # backoff
+            time.sleep(1.0 + attempt * 1.5)
+
+        return pd.DataFrame()
+
+    def _fallback_per_ticker(t: str) -> pd.DataFrame:
+        # último recurso: history() por ticker
+        try:
+            h = yf.Ticker(t).history(
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+            )
+            if h is None or h.empty:
+                return pd.DataFrame()
+
+            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in h.columns]
+            h = h[keep_cols].copy()
+            h.columns = pd.MultiIndex.from_tuples([(t, c) for c in h.columns], names=["Ticker", "Field"])
+            return h.sort_index(axis=1)
+        except Exception:
+            return pd.DataFrame()
+
+    # clean tickers
     tickers_unique = list(dict.fromkeys([t.strip().upper() for t in tickers if t and str(t).strip()]))
 
     parts: List[pd.DataFrame] = []
+
+    # 1) chunk download (con retries)
     for i in range(0, len(tickers_unique), chunk_size):
         chunk = tickers_unique[i:i + chunk_size]
+        d = _download_chunk(chunk)
+        if not d.empty:
+            parts.append(d)
 
-        data_chunk = yf.download(
-            tickers=chunk,
-            start=start_dt.strftime("%Y-%m-%d"),
-            end=end_dt.strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            group_by="column",
-            threads=True,
-            progress=False,
-        )
-
-        data_chunk = _normalize(data_chunk, chunk)
-        if not data_chunk.empty:
-            parts.append(data_chunk)
-
+    # 2) si no hay nada, fallback por ticker (más lento, pero salva Cloud)
     if not parts:
-        raise RuntimeError(
-            "yfinance returned empty data for all chunks. Likely Yahoo rate-limit / blocked requests on Streamlit Cloud. "
-            "Try smaller universe, smaller chunk_size (e.g., 40), or rerun later."
-        )
+        fb_parts: List[pd.DataFrame] = []
+        for t in tickers_unique:
+            d = _fallback_per_ticker(t)
+            if not d.empty:
+                fb_parts.append(d)
+            time.sleep(0.2)  # pequeño throttle
 
+        if not fb_parts:
+            raise RuntimeError(
+                "yfinance returned empty data for ALL tickers. "
+                "En Streamlit Cloud suele ser rate-limit/bloqueo temporal de Yahoo. "
+                "Reintenta más tarde o reduce el universo."
+            )
+
+        data = pd.concat(fb_parts, axis=1).sort_index(axis=1)
+        return data
+
+    # merge chunk results
     data = pd.concat(parts, axis=1).sort_index(axis=1)
-
     if not isinstance(data.columns, pd.MultiIndex):
-        raise RuntimeError("Download normalization failed (expected MultiIndex after concat).")
-
+        raise RuntimeError("Download normalization failed (expected MultiIndex).")
     return data
+
 
 
 def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
