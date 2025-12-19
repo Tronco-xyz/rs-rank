@@ -5,7 +5,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+import requests
 
 
 # -----------------------------
@@ -22,26 +22,12 @@ def pct_return(close: pd.DataFrame, periods: int) -> pd.Series:
     return r.iloc[-1]
 
 
-def atr_wilder(
-    high: pd.DataFrame,
-    low: pd.DataFrame,
-    close: pd.DataFrame,
-    window: int = 14,
-) -> pd.DataFrame:
-    """
-    Wilder ATR using EWM.
-    Robust against all-NaN slices.
-    """
+def atr_wilder(high: pd.DataFrame, low: pd.DataFrame, close: pd.DataFrame, window: int = 14) -> pd.DataFrame:
     prev_close = close.shift(1)
-
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
-
-    # MultiIndex safe: concat keeps (date, ticker) aligned; groupby level=1 does max per ticker
-    tr = pd.concat([tr1, tr2, tr3], axis=1)
-    tr = tr.groupby(level=1, axis=1).max()
-
+    tr = pd.concat([tr1, tr2, tr3], axis=1).groupby(level=1, axis=1).max()
     return tr.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
 
@@ -83,134 +69,75 @@ def to_rs_rank_1_99(rs_raw: pd.Series) -> pd.Series:
 
 
 # -----------------------------
-# Core
+# Stooq downloader
 # -----------------------------
 
-def _download_ohlc(
+def _stooq_symbol(t: str) -> str:
+    """
+    Stooq US equities use .us suffix and lower-case.
+    BRK-B -> brk-b.us
+    SPY -> spy.us
+    """
+    return f"{t.strip().lower()}.us"
+
+
+def _fetch_stooq_ohlc(ticker: str) -> pd.DataFrame:
+    """
+    Returns OHLCV with columns: Open, High, Low, Close, Volume indexed by Date.
+    Empty df if not available.
+    """
+    sym = _stooq_symbol(ticker)
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    r = requests.get(url, timeout=20)
+    if r.status_code != 200 or not r.text or "Date" not in r.text:
+        return pd.DataFrame()
+
+    df = pd.read_csv(pd.compat.StringIO(r.text))
+    if df.empty or "Date" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+    # standardize expected columns
+    cols = {c: c.capitalize() for c in df.columns}
+    df = df.rename(columns=cols)
+
+    needed = ["Open", "High", "Low", "Close"]
+    for c in needed:
+        if c not in df.columns:
+            return pd.DataFrame()
+
+    if "Volume" not in df.columns:
+        df["Volume"] = np.nan
+
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def _download_ohlc_stooq(
     tickers: List[str],
     start_dt: datetime,
     end_dt: datetime,
-    chunk_size: int = 25,      # más bajo para Streamlit Cloud
-    max_retries: int = 4,      # reintentos por chunk
 ) -> pd.DataFrame:
-    """
-    Robust yfinance downloader for Streamlit Cloud:
-    - Downloads tickers in chunks
-    - Retries with backoff when Yahoo returns empty
-    - Fallback per-ticker history() if download() keeps failing
-    - Normalizes output to MultiIndex columns (Ticker, Field)
-    """
-    import time
+    parts = []
+    for t in tickers:
+        o = _fetch_stooq_ohlc(t)
+        if o.empty:
+            continue
+        o = o.loc[(o.index >= start_dt) & (o.index <= end_dt)]
+        if o.empty:
+            continue
+        o.columns = pd.MultiIndex.from_tuples([(t, c) for c in o.columns], names=["Ticker", "Field"])
+        parts.append(o)
 
-    fields = {"Open", "High", "Low", "Close", "Volume"}
-
-    def _normalize(data: pd.DataFrame, tickers_in_chunk: List[str]) -> pd.DataFrame:
-        if data is None or data.empty:
-            return pd.DataFrame()
-
-        if not isinstance(data.columns, pd.MultiIndex):
-            # single ticker collapsed format
-            t = tickers_in_chunk[0] if len(tickers_in_chunk) == 1 else "SINGLE"
-            data.columns = pd.MultiIndex.from_tuples(
-                [(t, str(c)) for c in data.columns],
-                names=["Ticker", "Field"],
-            )
-            return data.sort_index(axis=1)
-
-        # MultiIndex could be (Field, Ticker) or (Ticker, Field)
-        lvl0 = set(map(str, data.columns.get_level_values(0)))
-        lvl1 = set(map(str, data.columns.get_level_values(1)))
-        lvl0_is_fields = len(lvl0.intersection(fields)) >= 3
-        lvl1_is_fields = len(lvl1.intersection(fields)) >= 3
-
-        if lvl0_is_fields and not lvl1_is_fields:
-            data = data.swaplevel(0, 1, axis=1)
-
-        data.columns = pd.MultiIndex.from_tuples(
-            [(str(t), str(f)) for t, f in data.columns],
-            names=["Ticker", "Field"],
-        )
-        return data.sort_index(axis=1)
-
-    def _download_chunk(chunk: List[str]) -> pd.DataFrame:
-        # retry loop
-        for attempt in range(max_retries):
-            try:
-                df = yf.download(
-                    tickers=chunk,
-                    start=start_dt.strftime("%Y-%m-%d"),
-                    end=end_dt.strftime("%Y-%m-%d"),
-                    auto_adjust=True,
-                    group_by="column",
-                    threads=False,     # importante en Streamlit Cloud
-                    progress=False,
-                )
-                df = _normalize(df, chunk)
-                if not df.empty:
-                    return df
-            except Exception:
-                pass
-
-            # backoff
-            time.sleep(1.0 + attempt * 1.5)
-
-        return pd.DataFrame()
-
-    def _fallback_per_ticker(t: str) -> pd.DataFrame:
-        # último recurso: history() por ticker
-        try:
-            h = yf.Ticker(t).history(
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=end_dt.strftime("%Y-%m-%d"),
-                auto_adjust=True,
-            )
-            if h is None or h.empty:
-                return pd.DataFrame()
-
-            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in h.columns]
-            h = h[keep_cols].copy()
-            h.columns = pd.MultiIndex.from_tuples([(t, c) for c in h.columns], names=["Ticker", "Field"])
-            return h.sort_index(axis=1)
-        except Exception:
-            return pd.DataFrame()
-
-    # clean tickers
-    tickers_unique = list(dict.fromkeys([t.strip().upper() for t in tickers if t and str(t).strip()]))
-
-    parts: List[pd.DataFrame] = []
-
-    # 1) chunk download (con retries)
-    for i in range(0, len(tickers_unique), chunk_size):
-        chunk = tickers_unique[i:i + chunk_size]
-        d = _download_chunk(chunk)
-        if not d.empty:
-            parts.append(d)
-
-    # 2) si no hay nada, fallback por ticker (más lento, pero salva Cloud)
     if not parts:
-        fb_parts: List[pd.DataFrame] = []
-        for t in tickers_unique:
-            d = _fallback_per_ticker(t)
-            if not d.empty:
-                fb_parts.append(d)
-            time.sleep(0.2)  # pequeño throttle
+        raise RuntimeError(
+            "No data returned from Stooq for any ticker. "
+            "Check internet access, tickers format, or try a smaller universe."
+        )
 
-        if not fb_parts:
-            raise RuntimeError(
-                "yfinance returned empty data for ALL tickers. "
-                "En Streamlit Cloud suele ser rate-limit/bloqueo temporal de Yahoo. "
-                "Reintenta más tarde o reduce el universo."
-            )
-
-        data = pd.concat(fb_parts, axis=1).sort_index(axis=1)
-        return data
-
-    # merge chunk results
     data = pd.concat(parts, axis=1).sort_index(axis=1)
-    if not isinstance(data.columns, pd.MultiIndex):
-        raise RuntimeError("Download normalization failed (expected MultiIndex).")
     return data
-
 
 
 def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
@@ -220,14 +147,11 @@ def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
 def run_scan(
     universe: List[str],
     benchmark: str = "SPY",
-    lookback_days: int = 600,
+    lookback_days: int = 900,          # Stooq daily history often works better with a bit more buffer
     top_n: Optional[int] = None,
-    # IBD windows / weights
     p12: int = 252, p9: int = 189, p6: int = 126, p3: int = 63,
     w12: float = 0.20, w9: float = 0.20, w6: float = 0.20, w3: float = 0.40,
-    # Performance horizons
     d1w: int = 5, d1m: int = 21, d1q: int = 63,
-    # ATR
     atr_window: int = 14,
     atr_multiplier: float = 2.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -236,19 +160,13 @@ def run_scan(
         raise ValueError("Universe is empty or too small.")
 
     benchmark = benchmark.strip().upper()
-    tickers = sorted(set([t.strip().upper() for t in universe] + [benchmark]))
+    tickers = sorted(set([t.strip().upper().replace(".", "-") for t in universe] + [benchmark]))
 
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=int(lookback_days))
 
-    data = _download_ohlc(tickers, start_dt, end_dt)
-
-    # If some chunks returned partial columns, ensure fields exist before xs()
-    needed_fields = {"Close", "High", "Low"}
-    got_fields = set(map(str, data.columns.get_level_values(1)))
-    missing = needed_fields.difference(got_fields)
-    if missing:
-        raise RuntimeError(f"Downloaded data missing required fields: {sorted(missing)}")
+    # Download from Stooq
+    data = _download_ohlc_stooq(tickers, start_dt, end_dt)
 
     close = data.xs("Close", level=1, axis=1)
     high  = data.xs("High",  level=1, axis=1)
@@ -266,18 +184,17 @@ def run_scan(
 
     keep, drop = [], []
     for t in tickers:
-        if t == benchmark:
-            keep.append(t)
-        elif valid_col(t):
+        if valid_col(t):
             keep.append(t)
         else:
-            drop.append(t)
+            if t != benchmark:
+                drop.append(t)
 
-    if benchmark not in keep or not valid_col(benchmark):
-        raise RuntimeError(f"Benchmark '{benchmark}' has insufficient data.")
+    if benchmark not in keep:
+        raise RuntimeError(f"Benchmark '{benchmark}' has insufficient data on Stooq.")
 
     dropped_df = (
-        pd.DataFrame({"Ticker": drop, "Reason": "insufficient OHLC history / missing in download"})
+        pd.DataFrame({"Ticker": drop, "Reason": "missing/insufficient data (Stooq)"})
         if drop else
         pd.DataFrame(columns=["Ticker", "Reason"])
     )
@@ -322,8 +239,9 @@ def run_scan(
 
     df = df.rename_axis("Ticker").reset_index()
 
-    for c in ["RS_Raw", "Price", atr_col, "Stop_ATR", "Dist_to_ATR_%", "Perf_1W", "Perf_1M", "Perf_1Q"]:
-        df[c] = df[c].round(2 if c != "RS_Raw" else 6)
+    df["RS_Raw"] = df["RS_Raw"].round(6)
+    for c in ["Price", atr_col, "Stop_ATR", "Dist_to_ATR_%", "Perf_1W", "Perf_1M", "Perf_1Q"]:
+        df[c] = df[c].round(2)
 
     df_out = df[[
         "Pos", "Ticker", "RS_Rank",
