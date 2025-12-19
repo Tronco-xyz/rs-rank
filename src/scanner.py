@@ -38,6 +38,7 @@ def atr_wilder(
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
 
+    # MultiIndex safe: concat keeps (date, ticker) aligned; groupby level=1 does max per ticker
     tr = pd.concat([tr1, tr2, tr3], axis=1)
     tr = tr.groupby(level=1, axis=1).max()
 
@@ -89,69 +90,79 @@ def _download_ohlc(
     tickers: List[str],
     start_dt: datetime,
     end_dt: datetime,
+    chunk_size: int = 80,   # Streamlit Cloud: 40–100 suele ir bien
 ) -> pd.DataFrame:
+    """
+    Robust yfinance downloader for Streamlit Cloud:
+    - Downloads tickers in chunks to reduce Yahoo rate-limit / payload issues.
+    - Normalizes output to MultiIndex columns (Ticker, Field).
+    """
     fields = {"Open", "High", "Low", "Close", "Volume"}
 
-    data = yf.download(
-        tickers=tickers,
-        start=start_dt.strftime("%Y-%m-%d"),
-        end=end_dt.strftime("%Y-%m-%d"),
-        auto_adjust=True,
-        group_by="column",
-        threads=True,
-        progress=False,
-    )
+    def _normalize(data: pd.DataFrame, tickers_in_chunk: List[str]) -> pd.DataFrame:
+        if data is None or data.empty:
+            return pd.DataFrame()
 
-    if data is None or data.empty:
-        raise RuntimeError(
-            "yfinance returned empty data. Possible causes: rate-limit, market holiday/weekend, "
-            "bad tickers, or network issues on Streamlit Cloud."
+        # Single ticker may return single-level columns: Open/High/Low/Close/Volume
+        if not isinstance(data.columns, pd.MultiIndex):
+            t = tickers_in_chunk[0] if len(tickers_in_chunk) == 1 else "SINGLE"
+            data.columns = pd.MultiIndex.from_tuples(
+                [(t, str(c)) for c in data.columns],
+                names=["Ticker", "Field"],
+            )
+            return data.sort_index(axis=1)
+
+        # MultiIndex could be (Field, Ticker) or (Ticker, Field)
+        lvl0 = set(map(str, data.columns.get_level_values(0)))
+        lvl1 = set(map(str, data.columns.get_level_values(1)))
+
+        lvl0_is_fields = len(lvl0.intersection(fields)) >= 3
+        lvl1_is_fields = len(lvl1.intersection(fields)) >= 3
+
+        # If it's (Field, Ticker) -> swap to (Ticker, Field)
+        if lvl0_is_fields and not lvl1_is_fields:
+            data = data.swaplevel(0, 1, axis=1)
+        # else if already (Ticker, Field), do nothing
+
+        # Final cleanup: ensure names + string types
+        data.columns = pd.MultiIndex.from_tuples(
+            [(str(t), str(f)) for t, f in data.columns],
+            names=["Ticker", "Field"],
         )
-
-    # Case A: Single ticker often returns single-level columns: Open/High/Low/Close/Volume
-    if not isinstance(data.columns, pd.MultiIndex):
-        # Determine which ticker it was (yfinance collapses)
-        t = tickers[0] if len(tickers) == 1 else "SINGLE"
-        # Build MultiIndex (Ticker, Field)
-        cols = []
-        for c in data.columns:
-            if str(c) in fields:
-                cols.append((t, str(c)))
-            else:
-                # keep unknown fields anyway
-                cols.append((t, str(c)))
-        data.columns = pd.MultiIndex.from_tuples(cols, names=["Ticker", "Field"])
         return data.sort_index(axis=1)
 
-    # Case B: MultiIndex, but could be (Field, Ticker) or (Ticker, Field)
-    lvl0 = set(map(str, data.columns.get_level_values(0)))
-    lvl1 = set(map(str, data.columns.get_level_values(1)))
+    tickers_unique = list(dict.fromkeys([t.strip().upper() for t in tickers if t and str(t).strip()]))
 
-    lvl0_is_fields = len(lvl0.intersection(fields)) >= 3
-    lvl1_is_fields = len(lvl1.intersection(fields)) >= 3
+    parts: List[pd.DataFrame] = []
+    for i in range(0, len(tickers_unique), chunk_size):
+        chunk = tickers_unique[i:i + chunk_size]
 
-    # If it's (Field, Ticker) -> swap to (Ticker, Field)
-    if lvl0_is_fields and not lvl1_is_fields:
-        data = data.swaplevel(0, 1, axis=1)
+        data_chunk = yf.download(
+            tickers=chunk,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            group_by="column",
+            threads=True,
+            progress=False,
+        )
 
-    # If it's already (Ticker, Field), keep as-is
-    # If ambiguous, still force to (Ticker, Field) by checking typical field names
-    elif not lvl0_is_fields and lvl1_is_fields:
-        pass
-    else:
-        # fallback: try swap and see if we get expected fields on level=1
-        swapped = data.swaplevel(0, 1, axis=1)
-        s_lvl1 = set(map(str, swapped.columns.get_level_values(1)))
-        if len(s_lvl1.intersection(fields)) >= 3:
-            data = swapped
+        data_chunk = _normalize(data_chunk, chunk)
+        if not data_chunk.empty:
+            parts.append(data_chunk)
 
-    # Final cleanup: ensure sorted and named
-    data.columns = pd.MultiIndex.from_tuples(
-        [(str(t), str(f)) for t, f in data.columns],
-        names=["Ticker", "Field"],
-    )
-    return data.sort_index(axis=1)
+    if not parts:
+        raise RuntimeError(
+            "yfinance returned empty data for all chunks. Likely Yahoo rate-limit / blocked requests on Streamlit Cloud. "
+            "Try smaller universe, smaller chunk_size (e.g., 40), or rerun later."
+        )
 
+    data = pd.concat(parts, axis=1).sort_index(axis=1)
+
+    if not isinstance(data.columns, pd.MultiIndex):
+        raise RuntimeError("Download normalization failed (expected MultiIndex after concat).")
+
+    return data
 
 
 def _min_required_bars(p12: int, d1q: int, atr_window: int) -> int:
@@ -184,6 +195,13 @@ def run_scan(
 
     data = _download_ohlc(tickers, start_dt, end_dt)
 
+    # If some chunks returned partial columns, ensure fields exist before xs()
+    needed_fields = {"Close", "High", "Low"}
+    got_fields = set(map(str, data.columns.get_level_values(1)))
+    missing = needed_fields.difference(got_fields)
+    if missing:
+        raise RuntimeError(f"Downloaded data missing required fields: {sorted(missing)}")
+
     close = data.xs("Close", level=1, axis=1)
     high  = data.xs("High",  level=1, axis=1)
     low   = data.xs("Low",   level=1, axis=1)
@@ -192,6 +210,7 @@ def run_scan(
 
     def valid_col(t: str) -> bool:
         return (
+            t in close.columns and t in high.columns and t in low.columns and
             close[t].dropna().shape[0] >= min_bars and
             high[t].dropna().shape[0]  >= min_bars and
             low[t].dropna().shape[0]   >= min_bars
@@ -201,7 +220,7 @@ def run_scan(
     for t in tickers:
         if t == benchmark:
             keep.append(t)
-        elif t in close.columns and valid_col(t):
+        elif valid_col(t):
             keep.append(t)
         else:
             drop.append(t)
@@ -210,7 +229,7 @@ def run_scan(
         raise RuntimeError(f"Benchmark '{benchmark}' has insufficient data.")
 
     dropped_df = (
-        pd.DataFrame({"Ticker": drop, "Reason": "insufficient OHLC history"})
+        pd.DataFrame({"Ticker": drop, "Reason": "insufficient OHLC history / missing in download"})
         if drop else
         pd.DataFrame(columns=["Ticker", "Reason"])
     )
