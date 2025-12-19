@@ -1,40 +1,38 @@
-# src/universes.py
-# Helpers for loading and managing ticker universes (Streamlit-compatible)
-
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
-import yfinance as yf
 
 
-# -------------------------------------------------------------------
-# Paths
-# -------------------------------------------------------------------
+# -----------------------------
+# Models
+# -----------------------------
+
+@dataclass(frozen=True)
+class UniverseSpec:
+    """
+    Defines one selectable universe in the app.
+    """
+    key: str          # stable internal id (e.g. "megacaps")
+    label: str        # UI label (e.g. "Mega Caps")
+    csv_path: Path    # CSV path with a 'Ticker' column
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
 def _project_root() -> Path:
-    # This file lives in <root>/src/universes.py
+    """
+    Resolve project root assuming this file lives in:
+    <root>/src/universes.py
+    """
     return Path(__file__).resolve().parents[1]
 
 
-UNIVERSES_DIR = _project_root() / "universes"
-
-
-# -------------------------------------------------------------------
-# Preset universes exposed in the UI
-# Keys MUST match app.py selectbox labels
-# -------------------------------------------------------------------
-PRESET_FILES: Dict[str, Path] = {
-    "Mega Caps": UNIVERSES_DIR / "megacaps.csv",
-    "S&P 500": UNIVERSES_DIR / "sp500.csv",
-    "ETFs": UNIVERSES_DIR / "etfs.csv",
-}
-
-
-# -------------------------------------------------------------------
-# Ticker utilities
-# -------------------------------------------------------------------
 def _clean_ticker(t: str) -> str:
     """
     Normalize tickers for yfinance:
@@ -47,105 +45,89 @@ def _clean_ticker(t: str) -> str:
     return str(t).strip().upper().replace(".", "-")
 
 
-def normalize_tickers(tickers: List[str]) -> List[str]:
-    """
-    Clean + de-duplicate tickers preserving order.
-    """
-    out: List[str] = []
-    seen = set()
-    for t in tickers:
-        ct = _clean_ticker(t)
-        if ct and ct not in seen:
-            seen.add(ct)
-            out.append(ct)
-    return out
+# -----------------------------
+# Loaders
+# -----------------------------
 
-
-def parse_ticker_text(text: str) -> List[str]:
-    """
-    Parse pasted text (comma, space or newline separated).
-    """
-    if not text:
-        return []
-    raw = (
-        text.replace(",", "\n")
-        .replace(";", "\n")
-        .splitlines()
-    )
-    return normalize_tickers(raw)
-
-
-# -------------------------------------------------------------------
-# CSV loaders
-# -------------------------------------------------------------------
 def load_universe_csv(csv_path: Path) -> List[str]:
     """
-    Load a universe from CSV.
-    Accepts column 'Ticker' or 'ticker'.
+    Load tickers from a CSV with a 'Ticker' column.
+    De-duplicates while preserving order.
     """
     if not csv_path.exists():
         raise FileNotFoundError(f"Universe file not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
 
-    col = None
-    if "Ticker" in df.columns:
-        col = "Ticker"
-    elif "ticker" in df.columns:
-        col = "ticker"
-    else:
+    if "Ticker" not in df.columns:
         raise ValueError(
-            f"{csv_path.name} must contain a 'Ticker' column"
+            f"Universe CSV must contain a 'Ticker' column: {csv_path.name}"
         )
 
-    tickers = df[col].astype(str).tolist()
-    tickers = normalize_tickers(tickers)
+    raw = df["Ticker"].astype(str).map(_clean_ticker)
+    raw = raw[raw != ""]
 
-    if not tickers:
+    seen = set()
+    out: List[str] = []
+    for t in raw.tolist():
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+
+    if not out:
         raise ValueError(f"No valid tickers found in {csv_path.name}")
 
-    return tickers
+    return out
 
 
-# -------------------------------------------------------------------
-# Fast availability check (optional, used by app.py)
-# -------------------------------------------------------------------
-def quick_validate_tickers(
-    tickers: List[str],
-    max_batch: int = 200,
+def get_default_universe_specs(
+    universes_dir: Optional[Path] = None
+) -> List[UniverseSpec]:
+    """
+    Curated universes exposed in the UI.
+    CSVs live in: <root>/universes/*.csv
+    """
+    root = _project_root()
+    udir = universes_dir or (root / "universes")
+
+    return [
+        UniverseSpec("megacaps", "Mega Caps", udir / "megacaps.csv"),
+        UniverseSpec("sp500", "S&P 500", udir / "sp500.csv"),
+        UniverseSpec("etfs", "ETFs", udir / "etfs.csv"),
+    ]
+
+
+def load_all_universes(
+    specs: Optional[List[UniverseSpec]] = None,
+    universes_dir: Optional[Path] = None,
+) -> Dict[str, List[str]]:
+    """
+    Load all universes and return:
+    { "Mega Caps": [...], "S&P 500": [...], "ETFs": [...] }
+    """
+    specs = specs or get_default_universe_specs(universes_dir)
+
+    out: Dict[str, List[str]] = {}
+    for spec in specs:
+        out[spec.label] = load_universe_csv(spec.csv_path)
+    return out
+
+
+def load_universe_by_key(
+    key: str,
+    specs: Optional[List[UniverseSpec]] = None,
+    universes_dir: Optional[Path] = None,
 ) -> List[str]:
     """
-    Very fast availability check using yfinance metadata.
-    Returns tickers that appear invalid/unavailable.
+    Load a single universe by its stable key
+    (megacaps / sp500 / etfs)
     """
-    invalid: List[str] = []
+    specs = specs or get_default_universe_specs(universes_dir)
+    key = (key or "").strip().lower()
 
-    for i in range(0, len(tickers), max_batch):
-        batch = tickers[i : i + max_batch]
-        try:
-            data = yf.download(
-                tickers=batch,
-                period="5d",
-                group_by="column",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
-        except Exception:
-            invalid.extend(batch)
-            continue
+    for spec in specs:
+        if spec.key == key:
+            return load_universe_csv(spec.csv_path)
 
-        if data is None or data.empty:
-            invalid.extend(batch)
-            continue
-
-        # If single ticker, yfinance returns single-index columns
-        if not isinstance(data.columns, pd.MultiIndex):
-            continue
-
-        available = set(data.columns.get_level_values(0))
-        for t in batch:
-            if t not in available:
-                invalid.append(t)
-
-    return sorted(set(invalid))
+    valid = ", ".join(s.key for s in specs)
+    raise ValueError(f"Unknown universe key '{key}'. Valid: {valid}")
